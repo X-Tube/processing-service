@@ -2,8 +2,6 @@ package queue
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"log"
 	"time"
 
@@ -11,51 +9,53 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 )
 
-type VideoUploadMessage struct {
-	VideoID string `json:"videoId"`
-	Bucket  string `json:"bucket"`
-	Key     string `json:"key"`
+type WorkerConfig struct {
+	MaxNumberOfMessages int32
+	WaitTimeSeconds    int32
+	VisibilityTimeout  int32
+	ErrorDelay          time.Duration
 }
 
 type Worker struct {
-	client   *sqs.Client
-	queueURL string
+	client    *sqs.Client
+	queueURL  string
+	config    WorkerConfig
+	processor MessageProcessor
 }
 
-func NewWorker(client *sqs.Client, queueURL string) *Worker {
+func NewWorker(client *sqs.Client, queueURL string, processor MessageProcessor, config WorkerConfig) *Worker {
 	return &Worker{
-		client:   client,
-		queueURL: queueURL,
+		client:    client,
+		queueURL:  queueURL,
+		config:    config,
+		processor: processor,
 	}
 }
 
 func (w *Worker) Start(ctx context.Context) {
-	log.Println("SQS worker started")
+	log.Printf("SQS %s worker started", w.processor.Name())
 
 	for {
-
 		select {
 		case <-ctx.Done():
-			log.Println("SQS worker stopped")
+			log.Printf("SQS %s worker stopped", w.processor.Name())
 			return
 
 		default:
-			err := w.poll(ctx)
-			if err != nil {
-				log.Println("SQS polling error:", err)
-				time.Sleep(2 * time.Second)
+			if err := w.poll(ctx); err != nil {
+				log.Printf("SQS %s polling error: %v", w.processor.Name(), err)
+				time.Sleep(w.config.ErrorDelay)
 			}
 		}
-
 	}
 }
 
 func (w *Worker) poll(ctx context.Context) error {
 	output, err := w.client.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
 		QueueUrl:            aws.String(w.queueURL),
-		MaxNumberOfMessages: 10,
-		WaitTimeSeconds:     20,
-		VisibilityTimeout:   60,
+		MaxNumberOfMessages: w.config.MaxNumberOfMessages,
+		WaitTimeSeconds:     w.config.WaitTimeSeconds,
+		VisibilityTimeout:   w.config.VisibilityTimeout,
 	})
 
 	if err != nil {
@@ -63,7 +63,6 @@ func (w *Worker) poll(ctx context.Context) error {
 	}
 
 	if len(output.Messages) == 0 {
-		log.Println("no messages")
 		return nil
 	}
 
@@ -72,9 +71,8 @@ func (w *Worker) poll(ctx context.Context) error {
 			continue
 		}
 
-		err := w.process(*message.Body)
-		if err != nil {
-			log.Println("message processing error:", err)
+		if err := w.processor.Process(ctx, *message.Body); err != nil {
+			log.Printf("SQS %s message processing error: %v", w.processor.Name(), err)
 			continue
 		}
 
@@ -84,27 +82,12 @@ func (w *Worker) poll(ctx context.Context) error {
 		})
 
 		if err != nil {
-			log.Println("delete message error:", err)
+			log.Printf("SQS %s delete message error: %v", w.processor.Name(), err)
 			continue
 		}
 
-		log.Println("message processed and deleted")
+		log.Printf("SQS %s message processed and deleted", w.processor.Name())
 	}
-
-	return nil
-}
-
-func (w *Worker) process(body string) error {
-	var message VideoUploadMessage
-
-	err := json.Unmarshal([]byte(body), &message)
-	if err != nil {
-		return err
-	}
-
-	fmt.Println("videoId:", message.VideoID)
-	fmt.Println("bucket:", message.Bucket)
-	fmt.Println("key:", message.Key)
 
 	return nil
 }
