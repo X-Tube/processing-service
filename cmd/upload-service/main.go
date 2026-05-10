@@ -9,12 +9,16 @@ import (
 	"time"
 
 	"github.com/X-Tube/processing-service/internal/config"
+	"github.com/X-Tube/processing-service/internal/observability"
 	"github.com/X-Tube/processing-service/internal/queue"
 )
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	logger := observability.NewLogger()
+	observability.StartServer(ctx, logger, ":9090")
 
 	videoQueueURL := os.Getenv("SQS_VIDEO_PROCESSING_URL")
 	if videoQueueURL == "" {
@@ -43,6 +47,7 @@ func main() {
 			VisibilityTimeout:   300,
 			ErrorDelay:          2 * time.Second,
 		},
+		logger,
 	)
 
 	thumbnailWorker := queue.NewWorker(
@@ -55,6 +60,7 @@ func main() {
 			VisibilityTimeout:   120,
 			ErrorDelay:          2 * time.Second,
 		},
+		logger,
 	)
 
 	go videoWorker.Start(ctx)

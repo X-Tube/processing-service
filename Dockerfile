@@ -17,4 +17,6 @@ WORKDIR /app
 
 COPY --from=builder /app/processing-service .
 
+EXPOSE 9090
+
 CMD ["./processing-service"]

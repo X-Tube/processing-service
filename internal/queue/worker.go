@@ -2,9 +2,10 @@ package queue
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"time"
 
+	"github.com/X-Tube/processing-service/internal/observability"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 )
@@ -21,29 +22,33 @@ type Worker struct {
 	queueURL  string
 	config    WorkerConfig
 	processor MessageProcessor
+	logger    *slog.Logger
 }
 
-func NewWorker(client *sqs.Client, queueURL string, processor MessageProcessor, config WorkerConfig) *Worker {
+func NewWorker(client *sqs.Client, queueURL string, processor MessageProcessor, config WorkerConfig, logger *slog.Logger) *Worker {
 	return &Worker{
 		client:    client,
 		queueURL:  queueURL,
 		config:    config,
 		processor: processor,
+		logger:    logger,
 	}
 }
 
 func (w *Worker) Start(ctx context.Context) {
-	log.Printf("SQS %s worker started", w.processor.Name())
+	queueName := w.processor.Name()
+
+	w.logger.Info("sqs worker started", "queue", queueName)
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("SQS %s worker stopped", w.processor.Name())
+			w.logger.Info("sqs worker stopped", "queue", queueName)
 			return
 
 		default:
 			if err := w.poll(ctx); err != nil {
-				log.Printf("SQS %s polling error: %v", w.processor.Name(), err)
+				w.logger.Error("sqs polling error", "queue", queueName, "error", err)
 				time.Sleep(w.config.ErrorDelay)
 			}
 		}
@@ -51,6 +56,8 @@ func (w *Worker) Start(ctx context.Context) {
 }
 
 func (w *Worker) poll(ctx context.Context) error {
+	queueName := w.processor.Name()
+
 	output, err := w.client.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
 		QueueUrl:            aws.String(w.queueURL),
 		MaxNumberOfMessages: w.config.MaxNumberOfMessages,
@@ -66,27 +73,40 @@ func (w *Worker) poll(ctx context.Context) error {
 		return nil
 	}
 
+	observability.SQSMessagesReceived.WithLabelValues(queueName).Add(float64(len(output.Messages)))
+
 	for _, message := range output.Messages {
 		if message.Body == nil || message.ReceiptHandle == nil {
 			continue
 		}
 
+		startedAt := time.Now()
+
 		if err := w.processor.Process(ctx, *message.Body); err != nil {
-			log.Printf("SQS %s message processing error: %v", w.processor.Name(), err)
+			observability.SQSMessagesProcessed.WithLabelValues(queueName, "error").Inc()
+			observability.ObserveDuration(observability.SQSProcessingDuration, queueName, startedAt)
+
+			w.logger.Error("sqs message processing error", "queue", queueName, "error", err)
+
 			continue
 		}
 
-		_, err = w.client.DeleteMessage(ctx, &sqs.DeleteMessageInput{
+		observability.SQSMessagesProcessed.WithLabelValues(queueName, "success").Inc()
+		observability.ObserveDuration(observability.SQSProcessingDuration, queueName, startedAt)
+
+		_, err := w.client.DeleteMessage(ctx, &sqs.DeleteMessageInput{
 			QueueUrl:      aws.String(w.queueURL),
 			ReceiptHandle: message.ReceiptHandle,
 		})
 
 		if err != nil {
-			log.Printf("SQS %s delete message error: %v", w.processor.Name(), err)
+			w.logger.Error("sqs delete message error", "queue", queueName, "error", err)
 			continue
 		}
 
-		log.Printf("SQS %s message processed and deleted", w.processor.Name())
+		observability.SQSMessagesDeleted.WithLabelValues(queueName).Inc()
+
+		w.logger.Info("sqs message processed and deleted", "queue", queueName)
 	}
 
 	return nil
