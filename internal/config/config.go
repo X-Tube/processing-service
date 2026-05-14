@@ -12,6 +12,7 @@ import (
 type Config struct {
 	AWS       AWS
 	Buckets   Buckets
+	Kafka     Kafka
 	Logging   Logging
 	Queues    Queues
 	Worker    Worker
@@ -31,6 +32,13 @@ type Buckets struct {
 	Output     string
 	Thumbnails string
 	Temp       string
+}
+
+type Kafka struct {
+	Enabled            bool
+	Brokers            []string
+	VideoProgressTopic string
+	ClientID           string
 }
 
 type Logging struct {
@@ -84,6 +92,12 @@ func Load(_ context.Context) (Config, error) {
 			Output:     os.Getenv("S3_BUCKET_OUTPUT"),
 			Thumbnails: os.Getenv("S3_BUCKET_THUMBNAILS"),
 			Temp:       os.Getenv("S3_BUCKET_TEMP"),
+		},
+		Kafka: Kafka{
+			Enabled:            envBool("KAFKA_ENABLED", true),
+			Brokers:            envList("KAFKA_BROKERS", []string{"localhost:9092"}),
+			VideoProgressTopic: envString("KAFKA_VIDEO_PROGRESS_TOPIC", "xtube.video.progress"),
+			ClientID:           envString("KAFKA_CLIENT_ID", "xtube-processing-service"),
 		},
 		Logging: Logging{
 			Level:          envString("LOG_LEVEL", "info"),
@@ -141,6 +155,28 @@ func (c Config) Validate() error {
 	}
 
 	return nil
+}
+
+func envList(name string, fallback []string) []string {
+	value := os.Getenv(name)
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+
+	parts := strings.Split(value, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			result = append(result, part)
+		}
+	}
+
+	if len(result) == 0 {
+		return fallback
+	}
+
+	return result
 }
 
 func envString(name, fallback string) string {

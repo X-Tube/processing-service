@@ -12,10 +12,12 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/X-Tube/processing-service/internal/progress"
 )
 
 func TestProcessorExtractVideoID(t *testing.T) {
-	processor := NewProcessor(ProcessorConfig{}, nil, nil, discardLogger())
+	processor := NewProcessor(ProcessorConfig{}, nil, nil, nil, discardLogger())
 
 	tests := map[string]string{
 		"uploads/video-123/original.mp4": "video-123",
@@ -58,6 +60,7 @@ func TestProcessorRejectsInvalidInput(t *testing.T) {
 
 func TestProcessorProcessesAndUploadsSegments(t *testing.T) {
 	store := &fakeObjectStore{}
+	publisher := &fakeProgressPublisher{}
 	segmenter := &fakeSegmenter{
 		segments: []Segment{
 			{Profile: "360p", Index: 1, FileName: "video-1.mp4"},
@@ -66,7 +69,7 @@ func TestProcessorProcessesAndUploadsSegments(t *testing.T) {
 			{Profile: "720p", Index: 1, FileName: "video-1.mp4"},
 		},
 	}
-	processor := newTestProcessor(t, store, segmenter)
+	processor := newTestProcessorWithPublisher(t, store, segmenter, publisher)
 
 	err := processor.Process(context.Background(), s3EventBody("xtube-videos-input", "uploads/video-123/original.mp4"))
 	if err != nil {
@@ -94,6 +97,16 @@ func TestProcessorProcessesAndUploadsSegments(t *testing.T) {
 	if !reflect.DeepEqual(store.uploadKeys, wantKeys) {
 		t.Fatalf("expected upload keys %v, got %v", wantKeys, store.uploadKeys)
 	}
+
+	wantEvents := []progress.VideoProgressEvent{
+		{VideoID: "video-123", ProgressPercent: 25},
+		{VideoID: "video-123", ProgressPercent: 50},
+		{VideoID: "video-123", ProgressPercent: 75},
+		{VideoID: "video-123", ProgressPercent: 100},
+	}
+	if !reflect.DeepEqual(publisher.events, wantEvents) {
+		t.Fatalf("expected progress events %v, got %v", wantEvents, publisher.events)
+	}
 }
 
 func TestProcessorPropagatesDownloadError(t *testing.T) {
@@ -116,11 +129,51 @@ func TestProcessorPropagatesSegmentError(t *testing.T) {
 
 func TestProcessorPropagatesUploadError(t *testing.T) {
 	segmenter := &fakeSegmenter{segments: []Segment{{Profile: "360p", Index: 1, FileName: "video-1.mp4"}}}
-	processor := newTestProcessor(t, &fakeObjectStore{uploadErr: errors.New("upload failed")}, segmenter)
+	publisher := &fakeProgressPublisher{}
+	processor := newTestProcessorWithPublisher(t, &fakeObjectStore{uploadErr: errors.New("upload failed")}, segmenter, publisher)
 
 	err := processor.Process(context.Background(), s3EventBody("xtube-videos-input", "uploads/video-123/original.mp4"))
 	if err == nil || !strings.Contains(err.Error(), "upload video segment video-123/360p/video-1.mp4") {
 		t.Fatalf("expected upload error, got %v", err)
+	}
+	if len(publisher.events) != 0 {
+		t.Fatalf("expected no progress events after upload failure, got %v", publisher.events)
+	}
+}
+
+func TestProcessorPropagatesProgressPublishError(t *testing.T) {
+	segmenter := &fakeSegmenter{segments: []Segment{{Profile: "360p", Index: 1, FileName: "video-1.mp4"}}}
+	processor := newTestProcessorWithPublisher(t, &fakeObjectStore{}, segmenter, &fakeProgressPublisher{err: errors.New("kafka failed")})
+
+	err := processor.Process(context.Background(), s3EventBody("xtube-videos-input", "uploads/video-123/original.mp4"))
+	if err == nil || !strings.Contains(err.Error(), "publish video progress for video-123") {
+		t.Fatalf("expected progress publish error, got %v", err)
+	}
+}
+
+func TestProcessorProgressUsesFloorAndLastChunkIsOneHundred(t *testing.T) {
+	publisher := &fakeProgressPublisher{}
+	segmenter := &fakeSegmenter{
+		segments: []Segment{
+			{Profile: "360p", Index: 1, FileName: "video-1.mp4"},
+			{Profile: "480p", Index: 1, FileName: "video-1.mp4"},
+			{Profile: "720p", Index: 1, FileName: "video-1.mp4"},
+		},
+	}
+	processor := newTestProcessorWithPublisher(t, &fakeObjectStore{}, segmenter, publisher)
+
+	err := processor.Process(context.Background(), s3EventBody("xtube-videos-input", "uploads/video-123/original.mp4"))
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	wantEvents := []progress.VideoProgressEvent{
+		{VideoID: "video-123", ProgressPercent: 33},
+		{VideoID: "video-123", ProgressPercent: 66},
+		{VideoID: "video-123", ProgressPercent: 100},
+	}
+	if !reflect.DeepEqual(publisher.events, wantEvents) {
+		t.Fatalf("expected progress events %v, got %v", wantEvents, publisher.events)
 	}
 }
 
@@ -179,7 +232,19 @@ func newTestProcessor(t *testing.T, store *fakeObjectStore, segmenter *fakeSegme
 	return newTestProcessorWithConfig(t, store, segmenter, ProcessorConfig{}, discardLogger())
 }
 
+func newTestProcessorWithPublisher(t *testing.T, store *fakeObjectStore, segmenter *fakeSegmenter, publisher progress.Publisher) *Processor {
+	t.Helper()
+
+	return newTestProcessorWithOptions(t, store, segmenter, publisher, ProcessorConfig{}, discardLogger())
+}
+
 func newTestProcessorWithConfig(t *testing.T, store *fakeObjectStore, segmenter *fakeSegmenter, overrides ProcessorConfig, logger *slog.Logger) *Processor {
+	t.Helper()
+
+	return newTestProcessorWithOptions(t, store, segmenter, nil, overrides, logger)
+}
+
+func newTestProcessorWithOptions(t *testing.T, store *fakeObjectStore, segmenter *fakeSegmenter, publisher progress.Publisher, overrides ProcessorConfig, logger *slog.Logger) *Processor {
 	t.Helper()
 
 	if store == nil {
@@ -203,6 +268,7 @@ func newTestProcessorWithConfig(t *testing.T, store *fakeObjectStore, segmenter 
 		},
 		store,
 		segmenter,
+		publisher,
 		logger,
 	)
 }
@@ -251,6 +317,21 @@ func (s *fakeObjectStore) UploadFile(_ context.Context, bucket, key, filePath st
 type fakeSegmenter struct {
 	segments []Segment
 	err      error
+}
+
+type fakeProgressPublisher struct {
+	events []progress.VideoProgressEvent
+	err    error
+}
+
+func (p *fakeProgressPublisher) PublishVideoProgress(_ context.Context, event progress.VideoProgressEvent) error {
+	if p.err != nil {
+		return p.err
+	}
+
+	p.events = append(p.events, event)
+
+	return nil
 }
 
 func (s *fakeSegmenter) Segment(_ context.Context, _ string, outputDir string, _ []Profile) ([]Segment, error) {

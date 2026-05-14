@@ -12,26 +12,32 @@ import (
 
 	"github.com/X-Tube/processing-service/internal/events"
 	"github.com/X-Tube/processing-service/internal/observability"
+	"github.com/X-Tube/processing-service/internal/progress"
 	"github.com/X-Tube/processing-service/internal/storage"
 )
 
 type Processor struct {
-	config    ProcessorConfig
-	store     storage.ObjectStore
-	segmenter Segmenter
-	logger    *slog.Logger
+	config            ProcessorConfig
+	store             storage.ObjectStore
+	segmenter         Segmenter
+	progressPublisher progress.Publisher
+	logger            *slog.Logger
 }
 
-func NewProcessor(config ProcessorConfig, store storage.ObjectStore, segmenter Segmenter, logger *slog.Logger) *Processor {
+func NewProcessor(config ProcessorConfig, store storage.ObjectStore, segmenter Segmenter, progressPublisher progress.Publisher, logger *slog.Logger) *Processor {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if progressPublisher == nil {
+		progressPublisher = progress.NoopPublisher{}
+	}
 
 	return &Processor{
-		config:    config,
-		store:     store,
-		segmenter: segmenter,
-		logger:    logger,
+		config:            config,
+		store:             store,
+		segmenter:         segmenter,
+		progressPublisher: progressPublisher,
+		logger:            logger,
 	}
 }
 
@@ -173,8 +179,11 @@ func (p *Processor) processVideo(ctx context.Context, input UploadInput) error {
 		return fmt.Errorf("no video segments generated")
 	}
 
+	totalChunks := len(segments)
+
 	uploadStartedAt := time.Now()
 	var uploadedSize int64
+	uploadedChunks := 0
 	for _, segment := range segments {
 		outputKey := p.outputKey(input.VideoID, segment)
 		chunkStartedAt := time.Now()
@@ -186,8 +195,19 @@ func (p *Processor) processVideo(ctx context.Context, input UploadInput) error {
 			return fmt.Errorf("upload video segment %s: %w", outputKey, err)
 		}
 		uploadedSize += segment.Size
+		uploadedChunks++
+		progressPercent := calculateProgressPercent(uploadedChunks, totalChunks)
 		if p.config.ChunkDetails {
 			p.logger.Debug("video chunk upload finished", "component", "processor", "worker", p.Name(), "video_id", input.VideoID, "resolution", segment.Profile, "chunk_index", segment.Index, "bucket", p.config.OutputBucket, "output_key", outputKey, "size_bytes", segment.Size, "duration_ms", observability.DurationMillis(chunkStartedAt))
+		}
+
+		event := progress.VideoProgressEvent{
+			VideoID:         input.VideoID,
+			ProgressPercent: progressPercent,
+		}
+		if err := p.progressPublisher.PublishVideoProgress(ctx, event); err != nil {
+			p.logger.Error("video progress publish failed", "component", "processor", "worker", p.Name(), "video_id", input.VideoID, "uploaded_chunks", uploadedChunks, "total_chunks", totalChunks, "progress_percent", progressPercent, "error", err)
+			return fmt.Errorf("publish video progress for %s: %w", input.VideoID, err)
 		}
 	}
 
@@ -199,6 +219,23 @@ func (p *Processor) processVideo(ctx context.Context, input UploadInput) error {
 
 func (p *Processor) outputKey(videoID string, segment Segment) string {
 	return path.Join(videoID, segment.Profile, segment.FileName)
+}
+
+func calculateProgressPercent(uploadedChunks, totalChunks int) int {
+	if totalChunks <= 0 || uploadedChunks <= 0 {
+		return 0
+	}
+
+	if uploadedChunks >= totalChunks {
+		return 100
+	}
+
+	percent := uploadedChunks * 100 / totalChunks
+	if percent > 100 {
+		return 100
+	}
+
+	return percent
 }
 
 func totalSegmentSize(segments []Segment) int64 {

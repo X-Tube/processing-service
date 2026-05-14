@@ -16,6 +16,10 @@ func TestLoadDefaultsAndOverrides(t *testing.T) {
 	t.Setenv("LOG_LEVEL", "debug")
 	t.Setenv("LOG_CHUNK_DETAILS", "true")
 	t.Setenv("LOG_FFMPEG_PROGRESS", "false")
+	t.Setenv("KAFKA_ENABLED", "false")
+	t.Setenv("KAFKA_BROKERS", "kafka-1:9092, kafka-2:9092")
+	t.Setenv("KAFKA_VIDEO_PROGRESS_TOPIC", "videos.progress")
+	t.Setenv("KAFKA_CLIENT_ID", "test-processing")
 
 	cfg, err := Load(context.Background())
 	if err != nil {
@@ -46,6 +50,18 @@ func TestLoadDefaultsAndOverrides(t *testing.T) {
 	if cfg.Logging.FFmpegProgress {
 		t.Fatalf("expected ffmpeg progress disabled")
 	}
+	if cfg.Kafka.Enabled {
+		t.Fatalf("expected kafka disabled")
+	}
+	if len(cfg.Kafka.Brokers) != 2 || cfg.Kafka.Brokers[0] != "kafka-1:9092" || cfg.Kafka.Brokers[1] != "kafka-2:9092" {
+		t.Fatalf("expected kafka brokers override, got %v", cfg.Kafka.Brokers)
+	}
+	if cfg.Kafka.VideoProgressTopic != "videos.progress" {
+		t.Fatalf("expected kafka topic override, got %q", cfg.Kafka.VideoProgressTopic)
+	}
+	if cfg.Kafka.ClientID != "test-processing" {
+		t.Fatalf("expected kafka client id override, got %q", cfg.Kafka.ClientID)
+	}
 }
 
 func TestLoadLoggingDefaults(t *testing.T) {
@@ -67,6 +83,18 @@ func TestLoadLoggingDefaults(t *testing.T) {
 	}
 	if !cfg.Logging.FFmpegProgress {
 		t.Fatalf("expected ffmpeg progress enabled by default")
+	}
+	if !cfg.Kafka.Enabled {
+		t.Fatalf("expected kafka enabled by default")
+	}
+	if len(cfg.Kafka.Brokers) != 1 || cfg.Kafka.Brokers[0] != "localhost:9092" {
+		t.Fatalf("expected default kafka broker localhost:9092, got %v", cfg.Kafka.Brokers)
+	}
+	if cfg.Kafka.VideoProgressTopic != "xtube.video.progress" {
+		t.Fatalf("expected default kafka topic, got %q", cfg.Kafka.VideoProgressTopic)
+	}
+	if cfg.Kafka.ClientID != "xtube-processing-service" {
+		t.Fatalf("expected default kafka client id, got %q", cfg.Kafka.ClientID)
 	}
 }
 

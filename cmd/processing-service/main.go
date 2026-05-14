@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -10,6 +11,7 @@ import (
 	"github.com/X-Tube/processing-service/internal/awsclient"
 	"github.com/X-Tube/processing-service/internal/config"
 	"github.com/X-Tube/processing-service/internal/observability"
+	"github.com/X-Tube/processing-service/internal/progress"
 	"github.com/X-Tube/processing-service/internal/storage"
 	"github.com/X-Tube/processing-service/internal/thumbnail"
 	"github.com/X-Tube/processing-service/internal/video"
@@ -38,6 +40,9 @@ func main() {
 	s3Client := awsclient.NewS3Client(awsConfig, appConfig.AWS.EndpointURL)
 	objectStore := storage.NewS3ObjectStore(s3Client)
 
+	progressPublisher, closeProgressPublisher := newProgressPublisher(appConfig, logger)
+	defer closeProgressPublisher()
+
 	videoProcessor := video.NewProcessor(
 		video.ProcessorConfig{
 			Name:         appConfig.Worker.VideoName,
@@ -54,6 +59,7 @@ func main() {
 			FFmpegProgress: appConfig.Logging.FFmpegProgress,
 			LogLevel:       appConfig.Logging.Level,
 		}, logger),
+		progressPublisher,
 		logger,
 	)
 
@@ -110,4 +116,26 @@ func videoProfiles(profiles []config.VideoProfile) []video.Profile {
 	}
 
 	return result
+}
+
+func newProgressPublisher(appConfig config.Config, logger *slog.Logger) (progress.Publisher, func()) {
+	if !appConfig.Kafka.Enabled {
+		logger.Info("kafka progress publisher disabled", "component", "kafka")
+		return progress.NoopPublisher{}, func() {}
+	}
+
+	publisher, err := progress.NewKafkaPublisher(progress.KafkaPublisherConfig{
+		Brokers:  appConfig.Kafka.Brokers,
+		Topic:    appConfig.Kafka.VideoProgressTopic,
+		ClientID: appConfig.Kafka.ClientID,
+	}, logger)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	return publisher, func() {
+		if err := publisher.Close(); err != nil {
+			logger.Error("kafka progress publisher close failed", "component", "kafka", "error", err)
+		}
+	}
 }
