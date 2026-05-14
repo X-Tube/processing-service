@@ -26,10 +26,10 @@ func StartServer(ctx context.Context, logger *slog.Logger, address string) {
 	}
 
 	go func() {
-		logger.Info("observability server started", "address", address)
+		logger.Info("observability server started", "component", "observability", "address", address)
 
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Error("observability server error", "error", err)
+			logger.Error("observability server error", "component", "observability", "error", err)
 		}
 	}()
 
@@ -40,7 +40,7 @@ func StartServer(ctx context.Context, logger *slog.Logger, address string) {
 		defer cancel()
 
 		if err := server.Shutdown(shutdownCtx); err != nil {
-			logger.Error("observability server shutdown error", "error", err)
+			logger.Error("observability server shutdown error", "component", "observability", "error", err)
 		}
 	}()
 }
